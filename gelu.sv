@@ -1,5 +1,42 @@
 `timescale 1ps / 1ps
 
+/*
+// =========================================================================
+// RETROSPECTIVE: KEY FUNCTIONAL BUGS FIXED
+// =========================================================================
+
+// 1. SIGN APPLICATION MULTIPLIER BUG (Stage 4)
+// STRUGGLE: Originally used `qerf <= ql * qsgn3`. 
+// WHY IT FAILED: `qsgn3` was just a 1-bit sign extractor (0 or 1). In hardware, 
+// multiplying by 1'b1 doesn't negate a number; it stays positive. 
+// FIX: Replaced with an explicit if/else (or ternary) to negate the value when 
+// the sign bit is active, accurately matching Python's `np.sign()`.
+if (qsgn3 == 1) begin
+    qerf <= -ql;
+end else begin
+    qerf <= ql;
+end
+
+// 2. LOGICAL VS. ARITHMETIC RIGHT SHIFT (Stage 5)
+// STRUGGLE: Originally used `>> SHIFT` for fixed-point scaling.
+// WHY IT FAILED: The `>>` operator is a logical right shift. It zero-fills the 
+// MSBs, which destroys the sign bit and turns negative numbers into massive 
+// positive values.
+// FIX: Swapped to `>>>`, the arithmetic right shift operator, which properly 
+// preserves and extends the sign bit for signed values.
+qout <= ((qerf >>> SHIFT) + q1) * qin4;
+
+
+// 3. SIGNED OPERAND CONTEXT LOSS (Stage 2)
+// STRUGGLE: Originally multiplied `qb * 2`.
+// WHY IT FAILED: In SystemVerilog, raw integer literals like `2` default to 
+// unsigned. If any operand in an expression is unsigned, the entire operation 
+// gets implicitly cast to unsigned, stripping `qb` of its signed context.
+// FIX: Explicitly cast the literal as signed using `32'sd2`.
+qb2 <= qb * 32'sd2;
+
+*/
+
 module gelu
 #(
     parameter integer D_W   = 32,
@@ -25,7 +62,6 @@ module gelu
 
     logic signed [D_W-1:0] qin1;
     logic signed [D_W-1:0] qin_abs;
-
 
     logic signed [D_W-1:0] qin2;
     logic signed [D_W-1:0] qb2;
@@ -72,47 +108,42 @@ module gelu
             out_valid  <= 0;
 
             
-        end else if (in_valid) begin // only do work when data is valid
-            qsgn <= {qin[D_W-1]}; //we can't actually make this combiantional because we need it later
+        end else begin // only do work when data is valid
+            qsgn <= qin[D_W-1]; //we can't actually make this combiantional because we need it later
             qin1 <= qin;
-            qin_abs <= qin;
-            out_valid1 <= 1;
-
-            //we need to tackle the abs
-            //if value is already positive we can keep it moving forward but if it is negative
-            // we need hardware to convert it
-            if (qin[D_W-1] != 0) begin
-                //bitwise negation
-                qin_abs <= qin * -1;
-            end
+            qin_abs <= (qin[D_W-1] != 0) ? -qin : qin;
+            out_valid1 <= in_valid;
 
             //coefficients are constant so don't need to pipeline them along
 
             // 2nd stage
-            qmin <= (qb > qin_abs) ? qb : qin_abs;
-            qb2 <= qb * 2;
+            qmin <= (-qb < qin_abs) ? -qb : qin_abs;
+            qb2 <= qb * 32'sd2; // need to specify signed values otherwise we default to unsigned which causes problems with negative numbers
+
             qsgn2 <= qsgn;
             qin2 <= qin1;
-
             out_valid2 <= out_valid1;
 
             // 3rd stage
             ql <= ((qmin + qb2) * qmin) + qc;
+
             qsgn3 <= qsgn2;
             qin3 <= qin2;
-
             out_valid3 <= out_valid2;
             
             //4th stage
-            qerf <= ql * qsgn3; // might need to move some of stage 3 into stage 4 -> we will look at timing
+            if (qsgn3 == 1) begin
+                qerf <= -ql;
+            end else begin
+                qerf <= ql;
+            end
+
             qin4 <= qin3;
             out_valid4 <= out_valid3;
 
             //5th stage
+            qout <= ((qerf >>> SHIFT) + q1) * qin4;
             out_valid <= out_valid4;
-            qout <= ((qerf >> SHIFT) + q1) * qin4;
-
-
 
             
         end

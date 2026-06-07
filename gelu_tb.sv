@@ -1,120 +1,113 @@
-`timescale 1ps/1ps
+`timescale 1ps / 1ps
 
-/*
-Clock gen, reset sequence, DUT instantiation, drive block, checker block, timeout block — these are the five pieces every TB needs.
-out_addr and in_addr must be separate counters because pipeline latency decouples input and output timing.
-Counter width needs $clog2(M)+1 bits to hold the value M itself, not just M-1.
-localparam for constants, not logic with initial assignment.
-$readmemh loads hex golden values — your Python script generates them from the reference model.
-Timeout block catches silent failures where DUT produces fewer outputs than expected — errors==0 alone doesn't catch that.
-*/
-
-module gelu_tb #(
+module gelu_tb 
+#(
     parameter integer D_W   = 32,
     parameter integer SHIFT = 14,
-    parameter integer M = 8
-)();
+    parameter integer M     = 8
+)
+();
 
-    localparam signed [D_W-1:0] QB = -1816;
-    localparam signed [D_W-1:0] QC = -348738;
-    localparam signed [D_W-1:0] Q1 = -223;
+localparam integer REP = M + 40;
 
-    //clk and reset
+reg       clk = 1'b0;
+reg [1:0] rst = 2'b11;
 
-    logic clk = 1'b0;
-    always #5 clk = ~clk;
+`ifndef XIL_TIMING
+always #1 clk = ~clk;
+`else
+always #20000 clk = ~clk;
+`endif
 
-    logic [1:0] rst = 2'b11;
+always @(posedge clk) begin
+    rst <= rst >> 1;
+end
 
-    always@(posedge clk) begin
-        rst <= rst >> 1;
-    end
+reg                   in_valid;
+reg  signed [D_W-1:0] qin;
+reg  signed [D_W-1:0] qb;
+reg  signed [D_W-1:0] qc;
+reg  signed [D_W-1:0] q1;
+wire                  out_valid;
+wire signed [D_W-1:0] qout;
 
-    logic in_valid;
-    logic signed [D_W-1:0] qin;
-    logic out_valid;
-    logic signed [D_W-1:0] qout;
+reg signed [D_W-1:0]     in_memory  [M-1:0];
+reg signed [D_W-1:0]     out_memory [M-1:0];
+reg        [$clog2(M):0] in_addr;
+reg        [$clog2(M):0] out_addr;
+reg        [$clog2(M):0] errors;
 
-    //read from mem files
-    logic signed [D_W-1:0] in_mem [M-1:0];
-    logic signed [D_W-1:0] out_mem [M-1:0];
+initial begin
+    $readmemh("gelu_in.mem", in_memory);
+    $readmemh("gelu_out.mem", out_memory);
+end
 
-    logic [$clog2(M):0] in_addr;
-    logic [$clog2(M):0] out_addr;
-
-    initial begin
-        $dumpfile("gelu.vcd");
-        $dumpvars(0, gelu_tb);
-        $readmemh("gelu_in.mem", in_mem);
-        $readmemh("gelu_out.mem", out_mem);
-    end
-
-    //dut
-    gelu #(
-        .D_W(D_W),
-        .SHIFT(SHIFT)
-    )
-    gelu_test (
-        .clk       (clk), 
-        .rst       (rst[0]),
-        .in_valid  (in_valid),
-        .qin       (qin),
-        .qb        (QB),
-        .qc        (QC),
-        .q1        (Q1),
-        .out_valid (out_valid),
-        .qout      (qout)
-    );
-
-
-
-
-    always_ff@(posedge clk) begin
-        if (rst) begin
+always @(posedge clk) begin
+    if (rst[0]) begin
+        in_addr  <= 0;
+        out_addr <= 0;
+        in_valid <= 0;
+        qin      <= 0;
+        qb       <= 0;
+        qc       <= 0;
+        q1       <= 0;
+        errors   <= 0;
+    end else begin
+        if (in_addr <= M-1) begin
+            in_addr  <= in_addr + 1;
+            in_valid <= 1;
+            qin      <= in_memory[in_addr];
+        end else begin
             in_valid <= 0;
-            qin <= 0;
-            in_addr <= 0;
-        end else begin
-            if (in_addr<M) begin
-                in_valid <= 1;
-                qin <= in_mem[in_addr];
-                in_addr <= in_addr + 1;
-            end else begin
-                in_valid <= 0;
+        end
+
+        qb <= -1816;
+        qc <= -348738;
+        q1 <= -223;
+
+        $display("# Time=%0d, in_valid=%0d, in_cntr=%0d, qin=%0d, out_valid=%0d, out_cntr=%0d, qout=%0d", $time, in_valid, in_addr, qin, out_valid, out_addr, qout);
+
+        if (out_valid) begin
+            out_addr <= out_addr + 1;
+            if (out_memory[out_addr] != qout || ^qout === 1'bX) begin
+                $display("# Error: Time=%0d, qout=%0d, true=%0d", $time, qout, out_memory[out_addr]);
+                errors <= errors + 1;
             end
         end
     end
+end
 
-    always_ff @( posedge clk ) begin : CHECKER
-        
-        if (rst) begin
-            out_addr <= 0;
-        end else begin
-
-            if (out_valid) begin
-
-                // === is like '==' but checks for Z and X as well 
-                // ^ is the reduction XOR operator, it will return 1 if any bit of qout is X!
-                if (out_mem[out_addr] != qout || ^qout === 1'bX) begin 
-                    $error("Test failed at index %d: expected %h, got %h", out_addr, out_mem[out_addr], qout);
-                end else begin
-                    $display("Test passed at index %d: expected %h, got %h", out_addr, out_mem[out_addr], qout);
-                end
-                out_addr <= out_addr + 1;
-            end
-            
-        end
-        
+initial begin
+    $timeformat(-9, 2, " ns", 20);
+    repeat(REP) @(posedge clk);
+    if (out_addr != M) begin
+        $display("# Error: Incorrect number of outputs were produced by the module: given inputs=%0d, produced outputs=%0d.", in_addr, out_addr);
+    end else begin
+        if (errors > 0)
+            $display("\n--\nErrors=%0d\n--\n", errors);
+        else
+            $display("\n--\nPASSED!\n--\n");
     end
+    $finish;
+end
 
+gelu
+`ifndef XIL_TIMING
+#(
+    .D_W   ( D_W    ),
+    .SHIFT ( SHIFT  )
+)
+`endif
+gelu_test (
+    .clk       ( clk       ), 
+    .rst       ( rst[0]    ),
+    .in_valid  ( in_valid  ),
+    .qin       ( qin       ),
+    .qb        ( qb        ),
+    .qc        ( qc        ),
+    .q1        ( q1        ),
+    .out_valid ( out_valid ),
+    .qout      ( qout      )
+);
 
-    initial begin
-        repeat (M+20) @(posedge clk);
-        if (out_addr != M) begin
-            $error("expected %d but got %d", M, out_addr);
-        end else begin
-            $display("PASSED");
-        end
-        $finish;
-    end
 endmodule
